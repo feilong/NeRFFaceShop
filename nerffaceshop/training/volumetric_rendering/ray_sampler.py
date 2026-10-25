@@ -71,7 +71,7 @@ class RaySampler(torch.nn.Module):
 
         uv = torch.stack(torch.meshgrid(torch.arange(resolution, dtype=torch.float32, device=cam2world_matrix.device), torch.arange(resolution, dtype=torch.float32, device=cam2world_matrix.device), indexing='ij')) * (1./resolution) + (0.5/resolution)
         uv = uv.flip(0).reshape(2, -1).transpose(1, 0)
-        uv = uv.unsqueeze(0).repeat(cam2world_matrix.shape[0], 1, 1)
+        uv = uv.unsqueeze(0).expand(cam2world_matrix.shape[0], -1, -1)  # local: expand instead of repeat
 
         x_cam = uv[:, :, 0].view(N, -1)
         y_cam = uv[:, :, 1].view(N, -1)
@@ -87,6 +87,6 @@ class RaySampler(torch.nn.Module):
         ray_dirs = world_rel_points - cam_locs_world[:, None, :]
         ray_dirs = torch.nn.functional.normalize(ray_dirs, dim=2)
 
-        ray_origins = cam_locs_world.unsqueeze(1).repeat(1, ray_dirs.shape[1], 1)
+        ray_origins = cam_locs_world.unsqueeze(1).expand(-1, ray_dirs.shape[1], -1)  # local: expand instead of repeat
 
         return ray_origins, ray_dirs

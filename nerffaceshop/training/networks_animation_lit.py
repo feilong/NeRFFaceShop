@@ -20,7 +20,9 @@ from einops import rearrange
 def batch_inverse_fields(fields: torch.Tensor):
     BT, C, H, W = fields.shape[:-3], *fields.shape[-3:]
     fields = fields.reshape(-1, C, H, W).field_()
-    return torch.cat([fields[_:_+1].inverse() for _ in range(fields.shape[0])]).tensor_().reshape(*BT, C, H, W)
+    # local patch: the installed torchfields is patched to invert a whole batch at
+    # once on any device (was a per-sample Python loop with a CPU round trip on MPS)
+    return fields.inverse().tensor_().reshape(*BT, C, H, W)
 
 #----------------------------------------------------------------------------
 
@@ -307,7 +309,7 @@ class TriplaneSynthesisLayer(torch.nn.Module):
         if self.use_noise and noise_mode == 'random':
             noise = torch.randn([x.shape[0], 1, 1, self.resolution, self.resolution], device=x.device).repeat([1, 3, 1, 1, 1]) * self.noise_strength
         if self.use_noise and noise_mode == 'const':
-            noise = self.noise_const[None, ...].repeat([x.shape[0], 3, 1, 1, 1]) * self.noise_strength
+            noise = self.noise_const[None, ...].expand(x.shape[0], 3, -1, -1, -1) * self.noise_strength  # local: expand instead of repeat
         if self.use_noise and noise_mode == 'random_store':
             self._noise = torch.randn([x.shape[0], 1, 1, self.resolution, self.resolution], device=x.device).repeat([1, 3, 1, 1, 1])
             noise = self._noise * self.noise_strength
@@ -340,7 +342,7 @@ class TriplaneSynthesisLayer(torch.nn.Module):
         noise = torch.cat([noise_xy, noise_yz, noise_zx], dim=0)
         
         flip_weight = (self.up == 1) # slightly faster
-        x = modulated_conv2d(x=x, noise=noise, weight=self.weight, styles=styles.repeat([3, 1]), up=self.up, padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
+        x = modulated_conv2d(x=x, noise=noise, weight=self.weight, styles=styles[None].expand(3, -1, -1).reshape(-1, styles.shape[-1]), up=self.up, padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
 
         act_gain = self.act_gain * gain
         act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
@@ -387,7 +389,7 @@ class TriplaneToRGBLayer(torch.nn.Module):
         # Concatenate along the batch axis for speeding up
         x = torch.cat([xy, yz, zx], dim=0)
         
-        x = modulated_conv2d(x=x, weight=self.weight, styles=styles.repeat([3, 1]), demodulate=False, fused_modconv=fused_modconv)
+        x = modulated_conv2d(x=x, weight=self.weight, styles=styles[None].expand(3, -1, -1).reshape(-1, styles.shape[-1]), demodulate=False, fused_modconv=fused_modconv)
         if self.bias is not None:
             x = bias_act.bias_act(x, self.bias.to(x.dtype), clamp=self.conv_clamp)
         
@@ -493,7 +495,7 @@ class TriplaneSynthesisBlock(torch.nn.Module):
             misc.assert_shape(wds, [None, self.num_dconv + self.num_dtorgb, self.w_dim])
             wd_iter = iter(wds.unbind(dim=1))
         
-        if ws.device.type != 'cuda' and wds.device.dtype != 'cuda':
+        if ws.device.type != 'cuda':  # local patch: upstream had a typo (wds.device.dtype) and crashed when wds is None
             force_fp32 = True
         dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
         memory_format = torch.channels_last if self.channels_last and not force_fp32 else torch.contiguous_format
@@ -889,6 +891,7 @@ class TriPlaneGenerator(torch.nn.Module):
         self.rendering_kwargs = rendering_kwargs
     
         self._last_planes = None
+        self._last_backbone = None
     
     def mapping(self, z, c, d, l, truncation_psi=1, truncation_cutoff=None, update_emas=False):
         if c is not None and self.rendering_kwargs['c_gen_conditioning_zero']:
@@ -898,7 +901,7 @@ class TriPlaneGenerator(torch.nn.Module):
             self.backbone.dmapping(d, None, update_emas=update_emas) if d is not None else None, \
             self.backbone.lmapping(None, l, update_emas=update_emas) if l is not None else None
 
-    def synthesis(self, ws, wds, wls, c, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, use_exp_mask=False, tar_template_exp_mapping=None, overrided_lplanes=None, return_planes=False, skip_sr=False, portrait_only=False, skip_dm=True, projection='perspective', only_frontal=True, **synthesis_kwargs):
+    def synthesis(self, ws, wds, wls, c, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, cached_backbone=None, use_exp_mask=False, tar_template_exp_mapping=None, overrided_lplanes=None, return_planes=False, skip_sr=False, portrait_only=False, skip_dm=True, projection='perspective', only_frontal=True, **synthesis_kwargs):
         cam2world_matrix = c[:, :16].view(-1, 4, 4)
         intrinsics = c[:, 16:].view(-1, int((c.shape[1]-16)**0.5), int((c.shape[1]-16)**0.5))
         
@@ -919,6 +922,13 @@ class TriPlaneGenerator(torch.nn.Module):
         deformation_planes_delta = None
         if use_cached_backbone and self._last_planes is not None:
             planes, lplanes = self._last_planes
+            x = None
+            return_dict = {}
+        elif cached_backbone is not None:
+            # local addition: reuse (x, planes) from an earlier call (see return_planes / _last_backbone)
+            # and recompute only the lighting planes, e.g. for lighting sweeps of a fixed identity+expression.
+            x, planes = cached_backbone
+            lplanes = self.backbone.lsynthesis(x, planes, wls, update_emas=update_emas, **synthesis_kwargs) if overrided_lplanes is None else overrided_lplanes
             return_dict = {}
         else:
             if self.deform_type == 'instance-specific':
@@ -950,12 +960,14 @@ class TriPlaneGenerator(torch.nn.Module):
                 lplanes = overrided_lplanes
         if cache_backbone:
             self._last_planes = planes, lplanes
+            if x is not None:
+                self._last_backbone = x, planes
         
         # Reshape output into three 32-channel planes
         misc.assert_shape(planes, [None, 3, 32, 256, 256])
         misc.assert_shape(lplanes, [None, 3, 32, 256, 256])
         if return_planes:
-            return {'planes': planes, 'lplanes': lplanes}
+            return {'planes': planes, 'lplanes': lplanes, 'x': x}
 
         # Perform volume rendering
         feature_samples, depth_samples, albedo_samples, shading_samples, deform_samples, weights_samples = self.renderer(planes, lplanes, deformation_planes_delta.permute(0, 1, 4, 2, 3) if not skip_dm and not portrait_only and deformation_planes_delta is not None else None, self.decoder, self.shading_decoder, ray_origins, ray_directions, self.rendering_kwargs | {'portrait_only': portrait_only}) # channels last

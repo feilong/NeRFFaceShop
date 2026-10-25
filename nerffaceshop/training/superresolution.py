@@ -43,7 +43,7 @@ class SuperresolutionHybrid8X(torch.nn.Module):
         self.register_buffer('resample_filter', upfirdn2d.setup_filter([1,3,3,1]))
 
     def forward(self, rgb, x, ws, **block_kwargs):
-        ws = ws[:, -1:, :].repeat(1, 3, 1)
+        ws = ws[:, -1:, :].expand(-1, 3, -1)  # local: expand instead of repeat
 
         if x.shape[-1] != self.input_resolution:
             x = torch.nn.functional.interpolate(x, size=(self.input_resolution, self.input_resolution),
@@ -75,7 +75,7 @@ class SuperresolutionHybrid4X(torch.nn.Module):
         self.register_buffer('resample_filter', upfirdn2d.setup_filter([1,3,3,1]))
 
     def forward(self, rgb, x, ws, **block_kwargs):
-        ws = ws[:, -1:, :].repeat(1, 3, 1)
+        ws = ws[:, -1:, :].expand(-1, 3, -1)  # local: expand instead of repeat
 
         if x.shape[-1] < self.input_resolution:
             x = torch.nn.functional.interpolate(x, size=(self.input_resolution, self.input_resolution),
@@ -108,7 +108,7 @@ class SuperresolutionHybrid2X(torch.nn.Module):
         self.register_buffer('resample_filter', upfirdn2d.setup_filter([1,3,3,1]))
 
     def forward(self, rgb, x, ws, **block_kwargs):
-        ws = ws[:, -1:, :].repeat(1, 3, 1)
+        ws = ws[:, -1:, :].expand(-1, 3, -1)  # local: expand instead of repeat
 
         if x.shape[-1] != self.input_resolution:
             x = torch.nn.functional.interpolate(x, size=(self.input_resolution, self.input_resolution),
@@ -140,7 +140,7 @@ class SuperresolutionHybridDeepfp32(torch.nn.Module):
         self.register_buffer('resample_filter', upfirdn2d.setup_filter([1,3,3,1]))
 
     def forward(self, rgb, x, ws, **block_kwargs):
-        ws = ws[:, -1:, :].repeat(1, 3, 1)
+        ws = ws[:, -1:, :].expand(-1, 3, -1)  # local: expand instead of repeat
 
         if x.shape[-1] < self.input_resolution:
             x = torch.nn.functional.interpolate(x, size=(self.input_resolution, self.input_resolution),
@@ -277,7 +277,7 @@ class SuperresolutionHybrid8XDC(torch.nn.Module):
                 img_channels=3, is_last=True, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), **block_kwargs)
 
     def forward(self, rgb, x, ws, **block_kwargs):
-        ws = ws[:, -1:, :].repeat(1, 3, 1)
+        ws = ws[:, -1:, :].expand(-1, 3, -1)  # local: expand instead of repeat
 
         if x.shape[-1] != self.input_resolution:
             x = torch.nn.functional.interpolate(x, size=(self.input_resolution, self.input_resolution),

@@ -161,7 +161,87 @@ def upfirdn2d(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1, impl='cu
     assert impl in ['ref', 'cuda']
     if impl == 'cuda' and x.device.type == 'cuda' and _init():
         return _upfirdn2d_cuda(up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain).apply(x, f)
+    if x.device.type == 'mps' and (f is None or f.ndim == 2):  # local patch: fast exact path for Apple MPS
+        return _upfirdn2d_mps(x, f, up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain)
     return _upfirdn2d_ref(x, f, up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain)
+
+#----------------------------------------------------------------------------
+
+_mps_filter_cache = dict()
+
+def _mps_prepared_filter(f, gain, flip, dtype, device):
+    """Filter as a [1,1,fh,fw] conv weight, cached per (buffer, gain, flip, dtype, device).
+    `flip` is True when the weight must be the flipped filter (correlation with flip(f) == convolution with f).
+    The cache keeps a reference to `f`, so its storage address cannot be reused by another tensor."""
+    key = (f.data_ptr(), tuple(f.shape), float(gain), bool(flip), dtype, str(device))
+    hit = _mps_filter_cache.get(key)
+    if hit is not None and hit[0] is f:
+        return hit[1]
+    w = f * (gain ** (f.ndim / 2))
+    w = w.to(dtype)
+    if flip:
+        w = w.flip(list(range(w.ndim)))
+    w = w[None, None].contiguous()
+    _mps_filter_cache[key] = (f, w)
+    return w
+
+@misc.profiled_function
+def _upfirdn2d_mps(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1):
+    """Local patch: exact re-implementation of `_upfirdn2d_ref()` for Apple MPS (2-D or None filter only).
+
+    Same results as the reference (bit-identical conv arithmetic), but:
+    * no 6-D zero-insertion pad (on MPS `constant_pad_nd` on the 6-D view costs ~8 ms per call even
+      when it is a no-op for up=1);
+    * upsampling is done by `conv_transpose2d(stride=up)`, which is the same zero-insert + convolve;
+    * the depthwise conv (groups=C) is replaced by a single-channel conv over the [N*C, 1, H, W] view,
+      since the same filter applies to every channel;
+    * non-negative symmetric padding is folded into the conv padding argument;
+    * the prepared (scaled, flipped) filter is cached instead of rebuilt every call.
+    """
+    assert isinstance(x, torch.Tensor) and x.ndim == 4
+    if f is None:
+        f = torch.ones([1, 1], dtype=torch.float32, device=x.device)
+    assert isinstance(f, torch.Tensor) and f.ndim == 2
+    assert f.dtype == torch.float32 and not f.requires_grad
+    batch_size, num_channels, in_height, in_width = x.shape
+    upx, upy = _parse_scaling(up)
+    downx, downy = _parse_scaling(down)
+    padx0, padx1, pady0, pady1 = _parse_padding(padding)
+    fh, fw = int(f.shape[0]), int(f.shape[1])
+
+    upW = in_width * upx + padx0 + padx1
+    upH = in_height * upy + pady0 + pady1
+    assert upW >= fw and upH >= fh
+    out_h = upH - fh + 1
+    out_w = upW - fw + 1
+
+    x = x.reshape([batch_size * num_channels, 1, in_height, in_width])
+    if upx == 1 and upy == 1:
+        w = _mps_prepared_filter(f, gain, not flip_filter, x.dtype, x.device)
+        if padx0 == padx1 and pady0 == pady1 and padx0 >= 0 and pady0 >= 0:
+            x = torch.nn.functional.conv2d(x, w, padding=[pady0, padx0])
+        else:
+            x = torch.nn.functional.pad(x, [max(padx0, 0), max(padx1, 0), max(pady0, 0), max(pady1, 0)])
+            x = x[:, :, max(-pady0, 0) : x.shape[2] - max(-pady1, 0), max(-padx0, 0) : x.shape[3] - max(-padx1, 0)]
+            x = torch.nn.functional.conv2d(x, w)
+    else:
+        # conv_transpose2d(x, k, stride) == zero-insert (no trailing zeros) then full convolution with k.
+        # The reference computes a valid correlation of the zero-padded, zero-inserted signal with
+        # flip(f) (i.e. convolution with f), so ref[i] == full[i + fh - 1 - pad0].
+        w = _mps_prepared_filter(f, gain, flip_filter, x.dtype, x.device)
+        full = torch.nn.functional.conv_transpose2d(x, w, stride=[upy, upx])
+        y0 = fh - 1 - pady0
+        x0 = fw - 1 - padx0
+        y1 = y0 + out_h
+        x1 = x0 + out_w
+        pad = [max(-x0, 0), max(x1 - full.shape[3], 0), max(-y0, 0), max(y1 - full.shape[2], 0)]
+        if any(pad):
+            full = torch.nn.functional.pad(full, pad)
+            y0 += pad[2]; y1 += pad[2]; x0 += pad[0]; x1 += pad[0]
+        x = full[:, :, y0:y1, x0:x1]
+
+    x = x[:, :, ::downy, ::downx]
+    return x.reshape([batch_size, num_channels, x.shape[2], x.shape[3]])
 
 #----------------------------------------------------------------------------
 
